@@ -187,6 +187,36 @@ func (sc *StatsClient) ListStats(patterns ...string) (entries []adapter.StatIden
 	return entries, nil
 }
 
+// ListSymlinks lists the symlinks among the entries matching patterns, resolved to
+// the entry and item each aliases. Entries that are not symlinks are skipped, so
+// patterns may be as broad as convenient.
+//
+// Like ListStats it reads names and indexes only - no counter data is copied - which
+// makes it cheap enough to rebuild the mapping on every epoch change. See
+// adapter.SymlinkEntry for what the mapping is good for.
+func (sc *StatsClient) ListSymlinks(patterns ...string) (symlinks []adapter.SymlinkEntry, err error) {
+	sc.accessLock.RLock()
+	defer sc.accessLock.RUnlock()
+
+	if !sc.isConnected() {
+		return nil, adapter.ErrStatsDisconnected
+	}
+	accessEpoch := sc.accessStart()
+	if accessEpoch == 0 {
+		return nil, adapter.ErrStatsAccessFailed
+	}
+
+	symlinks, err = sc.getSymlinkEntries(patterns...)
+	if err != nil {
+		return nil, err
+	}
+
+	if !sc.accessEnd(accessEpoch) {
+		return nil, adapter.ErrStatsDataBusy
+	}
+	return symlinks, nil
+}
+
 func (sc *StatsClient) DumpStats(patterns ...string) (entries []adapter.StatEntry, err error) {
 	sc.accessLock.RLock()
 	defer sc.accessLock.RUnlock()
@@ -576,6 +606,54 @@ func (sc *StatsClient) getIdentifierEntriesOnIndex(vector dirVector, indexes ...
 	return identifiers, nil
 }
 
+// getSymlinkEntries retrieves the symlinks among the entries matching desired
+// patterns, or among all entries if no pattern is provided.
+func (sc *StatsClient) getSymlinkEntries(patterns ...string) (symlinks []adapter.SymlinkEntry, err error) {
+	vector := sc.GetDirectoryVector()
+	if vector == nil {
+		return nil, fmt.Errorf("failed to get symlink entries: directory vector is nil")
+	}
+	indexes, err := sc.listIndexes(vector, patterns...)
+	if err != nil {
+		return nil, err
+	}
+	return sc.getSymlinkEntriesOnIndex(vector, indexes...)
+}
+
+// getSymlinkEntriesOnIndex resolves the symlinks among indexes to the entry and item
+// each of them aliases. Indexes that are not symlinks are skipped.
+func (sc *StatsClient) getSymlinkEntriesOnIndex(vector dirVector, indexes ...uint32) (symlinks []adapter.SymlinkEntry, err error) {
+	dirLen := *(*uint32)(vectorLen(vector))
+	for _, index := range indexes {
+		if index >= dirLen {
+			return nil, fmt.Errorf("stat entry index %d out of dir vector length (%d)", index, dirLen)
+		}
+		dirPtr, dirName, _ := sc.GetStatDirOnIndex(vector, index)
+		if len(dirName) == 0 {
+			continue
+		}
+		targetIndex, itemIndex, ok := sc.GetSymlinkIndexes(dirPtr)
+		if !ok {
+			continue
+		}
+		if targetIndex >= dirLen {
+			debugf("symlink %s aliases out of range index %d", dirName, targetIndex)
+			continue
+		}
+		_, targetName, _ := sc.GetStatDirOnIndex(vector, targetIndex)
+		symlinks = append(symlinks, adapter.SymlinkEntry{
+			StatIdentifier: adapter.StatIdentifier{
+				Index: index,
+				Name:  dirName,
+			},
+			TargetIndex: targetIndex,
+			TargetName:  targetName,
+			ItemIndex:   itemIndex,
+		})
+	}
+	return symlinks, nil
+}
+
 // listIndexes lists indexes for all stat entries that match any of the regex patterns.
 func (sc *StatsClient) listIndexes(vector dirVector, patterns ...string) (indexes []uint32, err error) {
 	if len(patterns) == 0 {
@@ -644,7 +722,9 @@ func (sc *StatsClient) updateStatOnIndex(entry *adapter.StatEntry, vector dirVec
 		// would skip it, leaving the entry frozen at its PrepareDir value forever.
 		// Re-resolve through the symlink instead. This allocates, unlike the in-place
 		// UpdateEntryData path, because the resolved item does not have a stable
-		// backing slice to write into.
+		// backing slice to write into; callers refreshing large numbers of symlinks
+		// on a tick are better served reading the backing vector and mapping it with
+		// ListSymlinks.
 		entry.Data = sc.CopyEntryData(dirPtr, ^uint32(0))
 		return nil
 	}

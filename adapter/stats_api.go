@@ -1,4 +1,5 @@
 // Copyright (c) 2019 Cisco and/or its affiliates.
+// Copyright (c) 2026 Meter, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -41,6 +42,9 @@ type StatsAPI interface {
 
 	// ListStats lists indexed names for stats matching patterns.
 	ListStats(patterns ...string) (indexes []StatIdentifier, err error)
+	// ListSymlinks lists symlink entries matching patterns, resolved to the
+	// entry and item each of them aliases.
+	ListSymlinks(patterns ...string) (symlinks []SymlinkEntry, err error)
 	// DumpStats dumps all stat entries.
 	DumpStats(patterns ...string) (entries []StatEntry, err error)
 
@@ -89,6 +93,28 @@ type StatEntry struct {
 	Type    StatType
 	Data    Stat
 	Symlink bool
+}
+
+// SymlinkEntry describes a symlink directory entry and the counter it aliases.
+//
+// VPP exposes some counters only as one vector plus a set of symlinks naming its
+// items: /node/errors is a single counter vector, and every /err/<node>/<reason>
+// is a symlink to one item of it. Reading the vector once is far cheaper than
+// resolving thousands of symlinks, but then the item names are recoverable only
+// from the symlinks, and an item's position is not derivable from anything else
+// (vlib_register_errors allocates it from a heap, and reuses freed holes).
+//
+// ListSymlinks reports that mapping, so a caller reading a vector directly can
+// label its items.
+type SymlinkEntry struct {
+	// StatIdentifier holds the name and directory index of the symlink itself.
+	StatIdentifier
+	// TargetIndex is the directory index of the aliased entry, in the same index
+	// space as StatIdentifier.Index, and TargetName is its name.
+	TargetIndex uint32
+	TargetName  []byte
+	// ItemIndex is the position within the aliased vector that the symlink names.
+	ItemIndex uint32
 }
 
 // Counter represents simple counter with single value, which is usually packet count.

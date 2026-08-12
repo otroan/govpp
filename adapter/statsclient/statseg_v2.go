@@ -1,4 +1,5 @@
 //  Copyright (c) 2020 Cisco and/or its affiliates.
+//  Copyright (c) 2026 Meter, Inc.
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
 //  you may not use this file except in compliance with the License.
@@ -578,6 +579,17 @@ func (ss *statSegmentV2) adjust(data dirVector) dirVector {
 func (ss *statSegmentV2) getErrorVector() dirVector {
 	header := ss.loadSharedHeader(ss.sharedHeader)
 	return ss.adjust(dirVector(&header.errorVector))
+}
+
+// GetSymlinkIndexes returns the target directory index and item index encoded in a
+// symlink directory segment's union data, or ok false if the segment is not a symlink.
+func (ss *statSegmentV2) GetSymlinkIndexes(segment dirSegment) (targetIndex, itemIndex uint32, ok bool) {
+	dirEntry := (*statSegDirectoryEntryV2)(segment)
+	if getStatType(dirEntry.directoryType, ss.getErrorVector() != nil) != adapter.Symlink {
+		return 0, 0, false
+	}
+	targetIndex, itemIndex = ss.getSymlinkIndexes(dirEntry)
+	return targetIndex, itemIndex, true
 }
 
 func (ss *statSegmentV2) getSymlinkIndexes(dirEntry *statSegDirectoryEntryV2) (index1, index2 uint32) {

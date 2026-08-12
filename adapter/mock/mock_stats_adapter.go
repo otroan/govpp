@@ -57,6 +57,12 @@ func (a *StatsAdapter) ListStats(patterns ...string) ([]adapter.StatIdentifier, 
 	return statNames, nil
 }
 
+// ListSymlinks mocks symlink listing. The mock holds no symlink metadata, so it
+// reports none.
+func (a *StatsAdapter) ListSymlinks(patterns ...string) ([]adapter.SymlinkEntry, error) {
+	return nil, nil
+}
+
 // DumpStats mocks all stat entries dump.
 func (a *StatsAdapter) DumpStats(patterns ...string) ([]adapter.StatEntry, error) {
 	return a.entries, nil

@@ -186,6 +186,64 @@ func symlinkValue(t *testing.T, e adapter.StatEntry) uint64 {
 	return uint64(s[0][0])
 }
 
+func TestListSymlinks(t *testing.T) {
+	values := []uint64{10, 20, 30}
+	f := newFakeSegment(t, values)
+	sc := f.client()
+
+	symlinks, err := sc.ListSymlinks()
+	if err != nil {
+		t.Fatal("ListSymlinks failed:", err)
+	}
+	if len(symlinks) != len(values) {
+		t.Fatalf("expected %d symlinks, got %d", len(values), len(symlinks))
+	}
+	for _, s := range symlinks {
+		if got, want := string(s.TargetName), "/node/errors"; got != want {
+			t.Errorf("%s: target name = %q, want %q", s.Name, got, want)
+		}
+		if s.TargetIndex != fakeTargetIndex {
+			t.Errorf("%s: target index = %d, want %d", s.Name, s.TargetIndex, fakeTargetIndex)
+		}
+		// The item index is the whole point: it must name the counter this symlink
+		// aliases, independent of the symlink's own directory index.
+		if got, want := string(s.Name), fakeErrName(s.ItemIndex); got != want {
+			t.Errorf("item index %d resolved to %q, want %q", s.ItemIndex, want, got)
+		}
+	}
+}
+
+// The mapping ListSymlinks reports must agree with what resolving the symlink
+// individually yields - otherwise a caller reading the backing vector directly and
+// labelling it from ListSymlinks would mislabel every item.
+func TestListSymlinksAgreesWithResolvedValues(t *testing.T) {
+	values := []uint64{11, 22, 33, 44}
+	f := newFakeSegment(t, values)
+	sc := f.client()
+
+	symlinks, err := sc.ListSymlinks()
+	if err != nil {
+		t.Fatal("ListSymlinks failed:", err)
+	}
+	entries, err := sc.DumpStats("^/err/")
+	if err != nil {
+		t.Fatal("DumpStats failed:", err)
+	}
+	byName := make(map[string]adapter.StatEntry, len(entries))
+	for _, e := range entries {
+		byName[string(e.Name)] = e
+	}
+	for _, s := range symlinks {
+		e, ok := byName[string(s.Name)]
+		if !ok {
+			t.Fatalf("%s: not returned by DumpStats", s.Name)
+		}
+		if got, want := symlinkValue(t, e), values[s.ItemIndex]; got != want {
+			t.Errorf("%s: resolved value %d, but item index %d holds %d", s.Name, got, s.ItemIndex, want)
+		}
+	}
+}
+
 // UpdateDir must re-resolve symlink entries. Before the fix the type check in
 // updateStatOnIndex skipped them - a symlink's directory type never equals the
 // resolved type of its data - so a prepared dir kept returning its PrepareDir values.
@@ -263,5 +321,29 @@ func TestUpdateDirStaleEpoch(t *testing.T) {
 	f.bumpEpoch()
 	if err := sc.UpdateDir(dir); err != adapter.ErrStatsDirStale {
 		t.Fatalf("UpdateDir after epoch change = %v, want %v", err, adapter.ErrStatsDirStale)
+	}
+}
+
+// v1 has no symlink target encoding, so nothing must be reported for it.
+func TestGetSymlinkIndexesV1(t *testing.T) {
+	ss := &statSegmentV1{}
+	if _, _, ok := ss.GetSymlinkIndexes(nil); ok {
+		t.Error("statSegmentV1 reported symlink indexes")
+	}
+}
+
+// A non-symlink segment must not be reported as one, even though its union data
+// would decode into a plausible-looking pair of indexes.
+func TestGetSymlinkIndexesNonSymlink(t *testing.T) {
+	f := newFakeSegment(t, []uint64{1})
+	ss := newStatSegmentV2(f.buf, int64(len(f.buf)))
+
+	vector := ss.GetDirectoryVector()
+	segment, name, _ := ss.GetStatDirOnIndex(vector, fakeTargetIndex)
+	if string(name) != "/node/errors" {
+		t.Fatalf("index %d is %q, want /node/errors", fakeTargetIndex, name)
+	}
+	if _, _, ok := ss.GetSymlinkIndexes(segment); ok {
+		t.Error("counter vector entry reported as a symlink")
 	}
 }
