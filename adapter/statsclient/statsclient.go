@@ -287,6 +287,7 @@ func (sc *StatsClient) UpdateDir(dir *adapter.StatDir) (err error) {
 	defer sc.accessLock.RUnlock()
 
 	if !sc.isConnected() {
+		clearRingBufferWindowsIn(dir.Entries)
 		return adapter.ErrStatsDisconnected
 	}
 
@@ -297,13 +298,16 @@ func (sc *StatsClient) UpdateDir(dir *adapter.StatDir) (err error) {
 	// confirms that same new epoch, so nothing catches it.
 	accessEpoch := sc.accessStart()
 	if accessEpoch == 0 {
+		clearRingBufferWindowsIn(dir.Entries)
 		return adapter.ErrStatsAccessFailed
 	}
 	if dir.Epoch != accessEpoch {
+		clearRingBufferWindowsIn(dir.Entries)
 		return adapter.ErrStatsDirStale
 	}
 	dirVector := sc.GetDirectoryVector()
 	if dirVector == nil {
+		clearRingBufferWindowsIn(dir.Entries)
 		return fmt.Errorf("failed to update dir: directory vector is nil")
 	}
 	// Symlinks are not refreshed one by one. VPP names every item of a counter
@@ -312,10 +316,20 @@ func (sc *StatsClient) UpdateDir(dir *adapter.StatDir) (err error) {
 	// individually re-reads the same backing vector once per item. Collect them
 	// by target instead and read each target once, below.
 	var symlinks map[uint32][]symlinkRef
+	// Room for the usual dir without allocating; a larger one spills to the heap.
+	var (
+		statsBuf   [2]ringStatUndo
+		nextSeqBuf [64]uint64
+		threadsBuf [64]adapter.RingBufferThreadMeta
+	)
+	undo := ringUndo{stats: statsBuf[:0], nextSeq: nextSeqBuf[:0], threads: threadsBuf[:0]}
 	for i := 0; i < len(dir.Entries); i++ {
+		if s, ok := dir.Entries[i].Data.(*adapter.RingBufferWindowStat); ok {
+			undo = undo.save(s)
+		}
 		ref, isSymlink, err := sc.updateStatOnIndex(&dir.Entries[i], dirVector)
 		if err != nil {
-			abandonRingBufferWindows(dir.Entries, i)
+			undo.rollback(dir.Entries)
 			return err
 		}
 		if !isSymlink {
@@ -327,32 +341,64 @@ func (sc *StatsClient) UpdateDir(dir *adapter.StatDir) (err error) {
 		symlinks[ref.target] = append(symlinks[ref.target], ref)
 	}
 	if err := sc.updateSymlinkGroups(dirVector, symlinks); err != nil {
-		abandonRingBufferWindows(dir.Entries, len(dir.Entries))
+		undo.rollback(dir.Entries)
 		return err
 	}
+	if accessEndHook != nil {
+		accessEndHook()
+	}
 	if !sc.accessEnd(accessEpoch) {
-		abandonRingBufferWindows(dir.Entries, len(dir.Entries))
+		undo.rollback(dir.Entries)
 		return adapter.ErrStatsDataBusy
 	}
 	return nil
 }
 
-// abandonRingBufferWindows undoes a refresh UpdateDir is about to fail: windows
-// in entries[:refreshed] get their cursors back, so a retry delivers the same
-// entries, and every window is emptied.
-func abandonRingBufferWindows(entries []adapter.StatEntry, refreshed int) {
+// accessEndHook runs in UpdateDir just before the read is validated. Tests only.
+var accessEndHook func()
+
+// ringUndo holds each ring window's state from before UpdateDir refreshed it.
+type ringUndo struct {
+	stats   []ringStatUndo
+	nextSeq []uint64
+	threads []adapter.RingBufferThreadMeta
+}
+
+type ringStatUndo struct {
+	s         *adapter.RingBufferWindowStat
+	saved     adapter.RingBufferWindowStat
+	nextSeqAt int
+	threadsAt int
+}
+
+func (u ringUndo) save(s *adapter.RingBufferWindowStat) ringUndo {
+	u.stats = append(u.stats, ringStatUndo{s: s, saved: *s, nextSeqAt: len(u.nextSeq), threadsAt: len(u.threads)})
+	for i := range s.Windows {
+		u.nextSeq = append(u.nextSeq, s.Windows[i].NextSeq)
+	}
+	u.threads = append(u.threads, s.Threads...)
+	return u
+}
+
+// rollback puts back every saved stat, newest first so a stat saved twice ends
+// up as it was before the first save, then empties every window in entries.
+func (u ringUndo) rollback(entries []adapter.StatEntry) {
+	for i := len(u.stats) - 1; i >= 0; i-- {
+		su := &u.stats[i]
+		*su.s = su.saved
+		for j := range su.s.Windows {
+			su.s.Windows[j].NextSeq = u.nextSeq[su.nextSeqAt+j]
+		}
+		copy(su.s.Threads, u.threads[su.threadsAt:])
+	}
+	clearRingBufferWindowsIn(entries)
+}
+
+func clearRingBufferWindowsIn(entries []adapter.StatEntry) {
 	for i := range entries {
-		s, ok := entries[i].Data.(*adapter.RingBufferWindowStat)
-		if !ok {
-			continue
+		if s, ok := entries[i].Data.(*adapter.RingBufferWindowStat); ok {
+			clearRingBufferWindows(s)
 		}
-		if i < refreshed {
-			for j := range s.Windows {
-				// A refresh leaves FirstSeq-Lost at the cursor it started from.
-				s.Windows[j].NextSeq = s.Windows[j].FirstSeq - s.Windows[j].Lost
-			}
-		}
-		clearRingBufferWindows(s)
 	}
 }
 
@@ -695,9 +741,7 @@ func (sc *StatsClient) updateStatOnIndex(entry *adapter.StatEntry, vector dirVec
 	// place: this runs once per prepared entry per tick, and cloning the name to
 	// compare it would allocate per entry for a value discarded immediately after.
 	dirPtr, dirType, match := sc.StatDirOnIndexMatches(vector, entry.Index, entry.Name)
-	if w, ok := entry.Data.(*adapter.RingBufferWindowStat); ok && (!match || dirType != entry.Type) {
-		// Left as it is, a window would hand its last entries out again.
-		clearRingBufferWindows(w)
+	if _, ok := entry.Data.(*adapter.RingBufferWindowStat); ok && (!match || dirType != entry.Type) {
 		return ref, false, adapter.ErrStatsDirStale
 	}
 	if !match || entry.Data == nil {

@@ -834,3 +834,89 @@ func TestRingBufferWindowBusyRefreshIsRetried(t *testing.T) {
 		})
 	}
 }
+
+// A refresh that UpdateDir rejects must not keep what it did to the stat, even
+// when it re-initialised it or resynced a cursor, neither of which the window
+// left after the refresh can be traced back from.
+func TestRingBufferWindowRejectedRefreshIsUndone(t *testing.T) {
+	tests := []struct {
+		name        string
+		skipBacklog bool
+		before      int             // produced and delivered before the rejected refresh
+		unread      int             // produced, not yet delivered
+		glitch      func(*fakeRing) // what the rejected refresh sees
+		restore     func(*fakeRing)
+		seqs        []uint64
+	}{
+		{
+			name:        "re-initialised on a transient header",
+			skipBacklog: true,
+			unread:      3,
+			glitch:      func(f *fakeRing) { f.setHeader(16, 2) }, // schema version
+			restore:     func(f *fakeRing) { f.setHeader(16, 1) },
+			seqs:        []uint64{0, 1, 2},
+		},
+		{
+			name:    "resynced on a transient sequence rewind",
+			before:  5,
+			unread:  2,
+			glitch:  func(f *fakeRing) { f.putU64(f.ringBase+f.metaOff+8, 2) },
+			restore: func(f *fakeRing) { f.putU64(f.ringBase+f.metaOff+8, f.seq[0]) },
+			seqs:    []uint64{5, 6},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeRing(t, 16, 8, 1)
+			sc, dir, s := prepareRing(t, f, 0, tc.skipBacklog)
+			refresh(t, sc, dir)
+			if tc.before > 0 {
+				f.produce(0, tc.before)
+				refresh(t, sc, dir)
+			}
+			f.produce(0, tc.unread)
+
+			tc.glitch(f)
+			accessEndHook = func() {
+				accessEndHook = nil
+				tc.restore(f)
+				f.putU64(fakeOffEpoch, 2)
+			}
+			t.Cleanup(func() { accessEndHook = nil })
+			if err := sc.UpdateDir(dir); err != adapter.ErrStatsDataBusy {
+				t.Fatalf("UpdateDir = %v, want %v", err, adapter.ErrStatsDataBusy)
+			}
+			wantWindow(t, s.Windows[0], 16, nil, 0, 0)
+
+			dir, err := sc.PrepareRingBuffer("/fake/records", 0, tc.skipBacklog)
+			if err != nil {
+				t.Fatalf("PrepareRingBuffer: %v", err)
+			}
+			dir.Entries[0].Data = s
+			refresh(t, sc, dir)
+			wantWindow(t, s.Windows[0], 16, tc.seqs, 0, 0)
+			refresh(t, sc, dir)
+			wantWindow(t, s.Windows[0], 16, nil, 0, 0)
+		})
+	}
+}
+
+// An UpdateDir that fails before reading anything must not leave the previous
+// refresh's entries in the window either.
+func TestRingBufferWindowStaleDirIsEmpty(t *testing.T) {
+	f := newFakeRing(t, 16, 8, 1)
+	sc, dir, s := prepareRing(t, f, 0, false)
+	refresh(t, sc, dir)
+	f.produce(0, 3)
+	refresh(t, sc, dir)
+	wantWindow(t, s.Windows[0], 16, []uint64{0, 1, 2}, 0, 0)
+
+	f.putU64(fakeOffEpoch, 2)
+	if err := sc.UpdateDir(dir); err != adapter.ErrStatsDirStale {
+		t.Fatalf("UpdateDir = %v, want %v", err, adapter.ErrStatsDirStale)
+	}
+	wantWindow(t, s.Windows[0], 16, nil, 0, 0)
+	if s.Windows[0].NextSeq != 3 {
+		t.Errorf("NextSeq = %d, want 3", s.Windows[0].NextSeq)
+	}
+}
